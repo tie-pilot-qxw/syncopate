@@ -5,7 +5,7 @@ Experimental compiler for fine-grained communication/computation overlap.
 ## Dependencies
 - Python 3.10+
 - PyTorch
-- Triton Distributed: install from https://github.com/ByteDance-Seed/Triton-distributed (this repository expects the custom merged variant). Without it, attention-related code/tests will fail.
+- Triton Distributed: install from https://github.com/ByteDance-Seed/Triton-distributed (this repository expects the custom merged variant to use [TLX](https://github.com/facebookexperimental/triton) extension. Without it, attention-related code/tests will fail, but gemms should work).
 
 ## Install
 - `pip install -e .`
