@@ -136,8 +136,13 @@ def gemm(a, # @sy.host_entry
     # assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
     # assert a.dtype == b.dtype, "Incompatible dtypes"
 
-    M, local_K = a.shape
-    N, local_K = b.shape
+    # M is the iteration extent along the output's row axis. For a plain local
+    # GEMM a.shape[0] == c.shape[0] == M; for fused remote-read/write modes one
+    # of them is per-rank-shrunk while the other carries the full M. Taking the
+    # max picks the right value across all three cases.
+    M = max(a.shape[0], c.shape[0])
+    local_K = a.shape[1]
+    N = b.shape[0]
 
     # M_per_rank = M // world_size
 

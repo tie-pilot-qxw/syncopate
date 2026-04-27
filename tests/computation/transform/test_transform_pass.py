@@ -7,7 +7,15 @@ from typing import Iterable, Sequence, Tuple
 import pytest
 import torch
 
-from syncopate.computation.transform import AnnotationTransformer
+from syncopate.communication.common_descriptors.all_gather import (
+    build_all_gather_plan_1d_swizzle,
+)
+from syncopate.communication.common_descriptors.reduce_scatter import (
+    build_reduce_scatter_direct_reduce_plan,
+)
+from syncopate.communication.descriptor import CommPlan
+from syncopate.computation.transform import AnnotationTransformer, RemoteBinding
+from syncopate.interface.lowering import lower_comm_plan_to_raw_schedules
 
 
 def __remove_autotune_decorator(source: str) -> str:
@@ -154,7 +162,8 @@ def test_persistent_gemm_injects_persistent_blocks():
 
     assert "# auto-generated persistent dispatch (wave-based)" in result
     assert "while tile_id >= past_tiles + cur_tiles" in result
-    assert "if new_wave and cur_signal_offset >= 0" in result
+    assert "if new_wave:" in result
+    assert "if cur_signal_offset >= 0" in result
     assert "tile_id - past_tiles" in result
     assert "pid_m += cur_m_offset" in result
     assert "pid_n += cur_n_offset" in result
@@ -376,6 +385,136 @@ def test_transformed_matmul_kernel_executes_on_gpu():
         rtol = 1e-2 if is_hip_cdna2() else 0
         assert torch_mod.allclose(out, ref, atol=1e-2, rtol=rtol)
 
+def _rs_direct_reduce_schedule(rank: int, world_size: int = 4):
+    plans = {
+        r: build_reduce_scatter_direct_reduce_plan(
+            shape=(64, 32),
+            dtype=torch.float16,
+            axis=0,
+            mesh_size=world_size,
+            rank=r,
+            src_buffer="src",
+            dst_buffer="dst",
+            transfer_kind="push",
+        )
+        for r in range(world_size)
+    }
+    cp = CommPlan(plans)
+    cp.plan_signals()
+    return lower_comm_plan_to_raw_schedules(cp)[rank]["src"]
+
+
+def _ag_pull_schedule(rank: int, world_size: int = 4):
+    plans = {
+        r: build_all_gather_plan_1d_swizzle(
+            shape=(64, 32),
+            dtype=torch.float16,
+            axis=0,
+            mesh_size=world_size,
+            rank=r,
+            buffer_name="a",
+            transfer_kind="pull",
+        )
+        for r in range(world_size)
+    }
+    cp = CommPlan(plans)
+    cp.plan_signals()
+    return lower_comm_plan_to_raw_schedules(cp)[rank]["a"]
+
+
+def test_remote_writer_rewrites_store_to_atomic_add():
+    schedule = _rs_direct_reduce_schedule(rank=0)
+    assert schedule.is_reduce()
+    assert schedule.role() == "producer"
+
+    transformer = AnnotationTransformer(
+        remote_descriptors={
+            "c_desc": RemoteBinding(base_ptr_arg="c_ptr", schedule=schedule)
+        }
+    )
+    source = (
+        Path("tests/computation/transform/examples/example_persistent_gemm.py")
+        .read_text()
+    )
+    result = transformer.transform(source)
+
+    # Signature picks up target_rank and dst_offsets.
+    assert "target_rank=None" in result
+    assert "dst_offsets=None" in result
+    # dl import added.
+    assert "import triton_dist.language as dl" in result
+    # Wave-0 setup: load offset 0 of target_rank, build remote ptr, rebuild c_desc.
+    assert "cur_target_rank = tl.load(target_rank)" in result
+    assert "remote_c_ptr = dl.symm_at(c_ptr, cur_target_rank)" in result
+    # Per-wave rebuild lives inside if new_wave: branch (use cur_wave).
+    assert "cur_target_rank = tl.load(target_rank + cur_wave)" in result
+    # Per-axis dst_offset adjustment is precomputed for the binding.
+    assert "dst_offset_adjust_m" in result
+    assert "dst_offset_adjust_n" in result
+    # Producer-with-reduce: every c_desc.store call becomes atomic_add and
+    # call-site offsets get the adjustment expressions appended.
+    assert "c_desc.store(" not in result
+    assert "c_desc.atomic_add(" in result
+    assert "(offs_am) + dst_offset_adjust_m" in result
+    assert "(offs_bn) + dst_offset_adjust_n" in result
+
+
+def test_remote_reader_keeps_load_and_rebuilds_per_wave():
+    schedule = _ag_pull_schedule(rank=0)
+    assert not schedule.is_reduce()
+    assert schedule.role() == "consumer"
+
+    transformer = AnnotationTransformer(
+        remote_descriptors={
+            "a_desc": RemoteBinding(base_ptr_arg="a_ptr", schedule=schedule)
+        }
+    )
+    source = (
+        Path("tests/computation/transform/examples/example_persistent_gemm.py")
+        .read_text()
+    )
+    result = transformer.transform(source)
+
+    assert "target_rank=None" in result
+    assert "dst_offsets=None" in result
+    assert "remote_a_ptr = dl.symm_at(a_ptr, cur_target_rank)" in result
+    assert "cur_target_rank = tl.load(target_rank + cur_wave)" in result
+    # Consumer mode: a_desc.load() preserved (no store->atomic_add rewrite),
+    # but its call-site offsets pick up the per-axis adjustment.
+    assert "a = a_desc.load(" in result
+    assert "(offs_am) + dst_offset_adjust_m" in result
+    assert "c_desc.atomic_add(" not in result
+    assert "c_desc.store(" in result
+
+
+def test_remote_descriptors_compose_with_consumer_signal_wait():
+    """When both consumer signal-wait and remote rebuild are active, the
+    new_wave branch should host both effects (wait nested under offset>=0,
+    remote rebuild unconditional under new_wave)."""
+    schedule = _ag_pull_schedule(rank=0)
+    transformer = AnnotationTransformer(
+        enable_consumer=True,
+        consumer_descriptors=("a_desc",),
+        remote_descriptors={
+            "a_desc": RemoteBinding(base_ptr_arg="a_ptr", schedule=schedule)
+        },
+    )
+    source = (
+        Path("tests/computation/transform/examples/example_persistent_gemm.py")
+        .read_text()
+    )
+    result = transformer.transform(source)
+
+    # Both args should appear.
+    assert "signal_ptr=None" in result
+    assert "target_rank=None" in result
+    # Inside the unified `if new_wave:` block, we expect both the nested wait
+    # and the remote rebuild path. We don't assert exact formatting, just that
+    # both effects co-exist in the produced source.
+    assert "if cur_signal_offset >= 0" in result
+    assert "remote_a_ptr = dl.symm_at(a_ptr, cur_target_rank)" in result
+
+
 if __name__ == "__main__":
     # test_example_matmul_injects_wave_dispatch_block()
     # test_example_attn_injects_wave_dispatch_with_range_axis()
@@ -384,3 +523,6 @@ if __name__ == "__main__":
     # test_persistent_gemm_injects_persistent_blocks()
     test_persistent_gemm_producer_injects_epilogue()
     test_persistent_gemm_dual_role_uses_distinct_signals()
+    test_remote_writer_rewrites_store_to_atomic_add()
+    test_remote_reader_keeps_load_and_rebuilds_per_wave()
+    test_remote_descriptors_compose_with_consumer_signal_wait()

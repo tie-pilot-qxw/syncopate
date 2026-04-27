@@ -13,6 +13,7 @@ from syncopate.communication.descriptor import (
     CommPlan,
     CommOp,
     DevicePlan,
+    ReduceOp,
     Signal,
     Transfer,
     TransferOp,
@@ -148,10 +149,15 @@ def lower_comm_plan_to_raw_schedules(
         signal: Optional[Signal],
         start_time: float,
         order_prefix: Tuple[int, ...],
+        peer_rank: Optional[int],
+        reduce_op: Optional[ReduceOp],
+        peer_region: Optional[BufferRegion],
     ) -> None:
         tiles = _region_to_tiles(region)
         if not tiles:
             return
+
+        peer_tiles = _region_to_tiles(peer_region) if peer_region is not None else []
 
         flags = role_flags[(device, buffer_name)]
         if is_consumer:
@@ -159,8 +165,30 @@ def lower_comm_plan_to_raw_schedules(
         else:
             flags["producer"] = True
 
+        # is_consumer reflects the comm's perspective on the buffer. The
+        # buffer holder's compute role is the inverse: if comm consumes the
+        # buffer (reads it out), compute produced it.
+        compute_role = "producer" if is_consumer else "consumer"
+
         for tile_idx, tile in enumerate(tiles):
-            block = TileBlock(tile=tile, signal=signal)
+            # Match each local tile to its peer-side counterpart by index. If
+            # the peer side enumerates a different number of tiles we fall
+            # back to None — the rewrite uses tile.offsets when dst_offsets is
+            # absent which keeps canonical accesses in place.
+            dst_offsets: Optional[Tuple[int, ...]]
+            if tile_idx < len(peer_tiles):
+                dst_offsets = peer_tiles[tile_idx].offsets
+            else:
+                dst_offsets = None
+
+            block = TileBlock(
+                tile=tile,
+                signal=signal,
+                peer_rank=peer_rank,
+                reduce_op=reduce_op,
+                role=compute_role,
+                dst_offsets=dst_offsets,
+            )
             order_key = order_prefix + (tile_idx,)
             if is_consumer:
                 key = (tile.offsets, tile.shape)
@@ -179,8 +207,9 @@ def lower_comm_plan_to_raw_schedules(
                 device_events[device].append((start_time, buffer_name, order_key, block))
 
     for start_time, origin_dev, stream_idx, op_idx, op in ops_with_time:
+        op_reduce_op = _reduce_op_for(op)
         local_order_prefix = (origin_dev, 0, stream_idx, op_idx)
-        for buffer_name, region, is_consumer in _local_buffer_regions(op):
+        for buffer_name, region, is_consumer, peer_rank, peer_region in _local_buffer_regions(op):
             if is_consumer:
                 signal = _dependency_signal_for_device(op, origin_dev)
             else:
@@ -193,10 +222,15 @@ def lower_comm_plan_to_raw_schedules(
                 signal=signal,
                 start_time=start_time,
                 order_prefix=local_order_prefix,
+                peer_rank=peer_rank,
+                reduce_op=op_reduce_op,
+                peer_region=peer_region,
             )
 
         remote_order_prefix = (origin_dev, 1, stream_idx, op_idx)
-        for target_dev, buffer_name, region, is_consumer in _remote_buffer_regions(origin_dev, op):
+        for target_dev, buffer_name, region, is_consumer, peer_rank, peer_region in _remote_buffer_regions(
+            origin_dev, op
+        ):
             if target_dev not in comm_plan.device_plans:
                 continue
             if is_consumer:
@@ -211,6 +245,9 @@ def lower_comm_plan_to_raw_schedules(
                 signal=signal,
                 start_time=start_time,
                 order_prefix=remote_order_prefix,
+                peer_rank=peer_rank,
+                reduce_op=op_reduce_op,
+                peer_region=peer_region,
             )
 
     for (device, buffer_name), tiles in consumer_first_touch.items():
@@ -225,8 +262,30 @@ def lower_comm_plan_to_raw_schedules(
         flags = role_flags.get((device, buffer_name))
         if flags and flags["consumer"] and not flags["producer"]:
             continue
-        if blocks:
-            get_builder(device, buffer_name).append_wave(list(blocks))
+        if not blocks:
+            continue
+        # Local-residency blocks represent the device's own slice of the buffer
+        # (peer == self). Infer compute role from observed comm role: comm
+        # producing the buffer means compute consumes it, and vice versa.
+        if flags is None:
+            compute_role: Optional[str] = None
+        elif flags["producer"] and not flags["consumer"]:
+            compute_role = "consumer"
+        elif flags["consumer"] and not flags["producer"]:
+            compute_role = "producer"
+        else:
+            compute_role = None
+        annotated_blocks = [
+            TileBlock(
+                tile=block.tile,
+                signal=block.signal,
+                peer_rank=device,
+                reduce_op=block.reduce_op,
+                role=compute_role,
+            )
+            for block in blocks
+        ]
+        get_builder(device, buffer_name).append_wave(annotated_blocks)
 
     for device, events in device_events.items():
         if not events:
@@ -272,12 +331,18 @@ def lower_comm_plan_to_raw_schedules(
     return lowered
 
 
-def _local_buffer_regions(op: CommOp) -> List[Tuple[str, BufferRegion, bool]]:
+def _local_buffer_regions(
+    op: CommOp,
+) -> List[Tuple[str, BufferRegion, bool, Optional[int], Optional[BufferRegion]]]:
     """Return buffer-region-role tuples that reside on the local device.
 
     The boolean flag is ``True`` when the transfer *consumes* data from the
     buffer (communication acts as the consumer) and ``False`` when the transfer
-    produces data into the buffer.
+    produces data into the buffer. The fourth element is the cross-device peer
+    associated with this regional touch (``None`` for purely local copies or
+    collectives). The fifth element is the *peer-side* counterpart region (the
+    region of the buffer on the peer device) for PUSH/PULL transfers; ``None``
+    when there is no peer-side region.
     """
 
     def ensure_region(name: str, region: Optional[BufferRegion]) -> BufferRegion:
@@ -287,28 +352,46 @@ def _local_buffer_regions(op: CommOp) -> List[Tuple[str, BufferRegion, bool]]:
 
     if isinstance(op, Transfer):
         if op.op == TransferOp.PUSH:
-            return [(op.src_buf, ensure_region(op.src_buf, op.src_region), True)]
+            local = ensure_region(op.src_buf, op.src_region)
+            peer_side = ensure_region(op.dst_buf, op.dst_region)
+            return [(op.src_buf, local, True, op.peer, peer_side)]
         if op.op == TransferOp.PULL:
-            return [(op.dst_buf, ensure_region(op.dst_buf, op.dst_region), False)]
+            local = ensure_region(op.dst_buf, op.dst_region)
+            peer_side = ensure_region(op.src_buf, op.src_region)
+            return [(op.dst_buf, local, False, op.peer, peer_side)]
         if op.op == TransferOp.LOCAL_COPY:
-            pairs: List[Tuple[str, BufferRegion, bool]] = []
-            pairs.append((op.src_buf, ensure_region(op.src_buf, op.src_region), True))
+            pairs: List[Tuple[str, BufferRegion, bool, Optional[int], Optional[BufferRegion]]] = []
+            src_region = ensure_region(op.src_buf, op.src_region)
+            dst_region = ensure_region(op.dst_buf, op.dst_region)
+            # No cross-device peer for a local copy, but the data still has a
+            # "destination side" — the dst_region within dst_buf on the same
+            # device. Capturing it lets fused producers see e.g. dst_offset=0
+            # for the local wave of a reduce-scatter, instead of falling back
+            # to the source-side row offset which would land out of bounds.
+            pairs.append((op.src_buf, src_region, True, None, dst_region))
             if op.dst_buf != op.src_buf or op.dst_region != op.src_region:
-                pairs.append((op.dst_buf, ensure_region(op.dst_buf, op.dst_region), False))
+                pairs.append((op.dst_buf, dst_region, False, None, src_region))
             return pairs
         raise _ScheduleError(f"unsupported transfer operation: {op.op}")
 
     if isinstance(op, Collective):
-        pairs: List[Tuple[str, BufferRegion, bool]] = []
-        pairs.append((op.src_buf, ensure_region(op.src_buf, op.src_region), True))
-        pairs.append((op.dst_buf, ensure_region(op.dst_buf, op.dst_region), False))
+        pairs: List[Tuple[str, BufferRegion, bool, Optional[int], Optional[BufferRegion]]] = []
+        pairs.append((op.src_buf, ensure_region(op.src_buf, op.src_region), True, None, None))
+        pairs.append((op.dst_buf, ensure_region(op.dst_buf, op.dst_region), False, None, None))
         return pairs
 
     raise _ScheduleError(f"unsupported op type: {type(op)}")
 
 
-def _remote_buffer_regions(origin_dev: int, op: CommOp) -> List[Tuple[int, str, BufferRegion, bool]]:
-    """Return remote buffer interactions for the transfer."""
+def _remote_buffer_regions(
+    origin_dev: int, op: CommOp
+) -> List[Tuple[int, str, BufferRegion, bool, int, Optional[BufferRegion]]]:
+    """Return remote buffer interactions for the transfer.
+
+    Like ``_local_buffer_regions`` the last element is the peer-side
+    counterpart region — but here "peer" is the *origin* device from the remote
+    side's perspective.
+    """
 
     def ensure_region(name: str, region: Optional[BufferRegion]) -> BufferRegion:
         if region is None:
@@ -319,21 +402,27 @@ def _remote_buffer_regions(origin_dev: int, op: CommOp) -> List[Tuple[int, str, 
         if op.op == TransferOp.PUSH:
             if op.peer is None:
                 raise _ScheduleError("push transfer lacks peer device")
-            return [
-                (op.peer, op.dst_buf, ensure_region(op.dst_buf, op.dst_region), False),
-            ]
+            local = ensure_region(op.dst_buf, op.dst_region)
+            peer_side = ensure_region(op.src_buf, op.src_region)
+            return [(op.peer, op.dst_buf, local, False, origin_dev, peer_side)]
         if op.op == TransferOp.PULL:
             if op.peer is None:
                 raise _ScheduleError("pull transfer lacks peer device")
-            return [
-                (op.peer, op.src_buf, ensure_region(op.src_buf, op.src_region), True),
-            ]
+            local = ensure_region(op.src_buf, op.src_region)
+            peer_side = ensure_region(op.dst_buf, op.dst_region)
+            return [(op.peer, op.src_buf, local, True, origin_dev, peer_side)]
         return []
 
     if isinstance(op, Collective):
         return []
 
     raise _ScheduleError(f"unsupported op type: {type(op)}")
+
+
+def _reduce_op_for(op: CommOp) -> Optional[ReduceOp]:
+    if isinstance(op, Transfer):
+        return op.reduce_op
+    return None
 
 
 def _transfer_signal_for_device(op: CommOp, device: int) -> Optional[Signal]:

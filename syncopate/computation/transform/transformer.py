@@ -1,10 +1,54 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Mapping, Optional, Tuple
+
+from syncopate.interface.tile_schedule import RawSchedule
 
 from .annotations import AnnotationError, AxisCount, ParsedAnnotations, parse_annotations
+
+
+@dataclass(frozen=True)
+class RemoteBinding:
+    """Binds a kernel-local descriptor to a base pointer + schedule.
+
+    The schedule is consulted at transform time to decide:
+      * whether the producer epilogue should use ``store`` or ``atomic_add``
+        (driven by ``schedule.is_reduce()``)
+      * whether compute reads or writes the descriptor
+        (driven by ``schedule.role()``)
+
+    Per-wave peer ranks come from ``schedule.gen_target_rank_list()`` at host
+    setup time; the kernel simply receives the resulting tensor as
+    ``target_rank``/``target_rank_<desc>``.
+    """
+
+    base_ptr_arg: str
+    schedule: RawSchedule
+
+
+@dataclass(frozen=True)
+class _RemoteSpec:
+    """Internal companion of RemoteBinding with derived names + decl range."""
+
+    descriptor: str
+    base_ptr_arg: str
+    target_rank_arg: str
+    cur_target_rank_var: str
+    remote_ptr_var: str
+    decl_start: int
+    decl_end: int
+    is_reduce: bool
+    role: Optional[str]
+    rebuild_template: List[str]  # absolute-indented lines for rebuild snippet
+    dst_offsets_arg: str  # kernel arg name carrying per-wave dst offsets
+    # axis_name -> (cur_dst_offset_var, dst_offset_adjust_var)
+    axis_var_names: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+    # For each descriptor offset position, the annotation-axis name it maps to
+    # (or None when the descriptor axis is not partitioned by the schedule, so
+    # call-site offsets at that position need no adjustment).
+    descriptor_axes: Tuple[Optional[str], ...] = ()
 
 
 def _find_def_start(lines: List[str], dispatch_start: int) -> int:
@@ -101,6 +145,197 @@ def _block_product_expr(axis_counts: List[AxisCount]) -> Optional[str]:
 
 
 _IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+
+
+def _find_descriptor_decl(lines: List[str], desc_name: str) -> Tuple[int, int]:
+    """Locate the multi/single-line `<desc> = tl.make_tensor_descriptor(...)` block.
+
+    Returns the inclusive range ``(start, end)``. Raises if not found or if the
+    parenthesis tracking fails to close.
+    """
+    pattern = re.compile(
+        rf"^\s*{re.escape(desc_name)}\s*=\s*tl\.make_tensor_descriptor\s*\("
+    )
+    for idx, line in enumerate(lines):
+        if pattern.match(line):
+            depth = line.count("(") - line.count(")")
+            end = idx
+            while depth > 0 and end < len(lines) - 1:
+                end += 1
+                depth += lines[end].count("(") - lines[end].count(")")
+            if depth != 0:
+                raise AnnotationError(
+                    f"Unbalanced parentheses while parsing descriptor '{desc_name}'"
+                )
+            return idx, end
+    raise AnnotationError(f"Descriptor declaration '{desc_name} = tl.make_tensor_descriptor(...)' not found")
+
+
+def _replace_first_identifier(lines: List[str], identifier: str, replacement: str) -> List[str]:
+    """Replace the first standalone occurrence of ``identifier`` across the lines."""
+    pattern = re.compile(rf"\b{re.escape(identifier)}\b")
+    for idx, line in enumerate(lines):
+        match = pattern.search(line)
+        if match is None:
+            continue
+        return lines[:idx] + [line[: match.start()] + replacement + line[match.end():]] + lines[idx + 1:]
+    raise AnnotationError(f"Identifier '{identifier}' not found while rebuilding descriptor")
+
+
+def _strip_indent(lines: List[str]) -> Tuple[str, List[str]]:
+    """Return the common leading whitespace and the lines with that prefix stripped."""
+    if not lines:
+        return "", []
+    base_indent: Optional[str] = None
+    for line in lines:
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+        indent = line[: len(line) - len(stripped)]
+        if base_indent is None or len(indent) < len(base_indent):
+            base_indent = indent
+    if base_indent is None:
+        return "", list(lines)
+    return base_indent, [line[len(base_indent):] if line.startswith(base_indent) else line for line in lines]
+
+
+def _reindent(lines: List[str], indent: str) -> List[str]:
+    return [f"{indent}{line}" if line.strip() else line for line in lines]
+
+
+def _rewrite_store_to_atomic_add(lines: List[str], descriptor: str) -> None:
+    """In-place: rewrite `<descriptor>.store(` to `<descriptor>.atomic_add(`."""
+    pattern = re.compile(rf"\b{re.escape(descriptor)}\.store\(")
+    replacement = f"{descriptor}.atomic_add("
+    for idx, line in enumerate(lines):
+        if pattern.search(line):
+            lines[idx] = pattern.sub(replacement, line)
+
+
+def _extract_descriptor_shape_axes(
+    decl_lines: List[str], axis_names: List[str]
+) -> Tuple[Optional[str], ...]:
+    """Map each shape position of a `tl.make_tensor_descriptor(...)` declaration
+    to the annotation axis whose name appears as an identifier at that position
+    (or ``None`` if no annotation axis matches there)."""
+    text = "\n".join(decl_lines)
+    match = re.search(r"shape\s*=\s*\[([\s\S]*?)\]", text)
+    if not match:
+        return ()
+    shape_str = match.group(1)
+    positions = _split_top_level_commas(shape_str)
+    result: List[Optional[str]] = []
+    axis_set = set(axis_names)
+    for part in positions:
+        identifiers = set(_IDENTIFIER_RE.findall(part))
+        hits = [name for name in axis_names if name in identifiers and name in axis_set]
+        result.append(hits[0] if len(hits) == 1 else None)
+    return tuple(result)
+
+
+def _rewrite_descriptor_shape_positions(
+    lines: List[str], peer_extents: List[Optional[str]]
+) -> List[str]:
+    """Replace matched positions in the `shape=[...]` of a
+    ``make_tensor_descriptor`` declaration with peer-side extent expressions.
+
+    ``peer_extents[i]`` is the textual replacement for position ``i`` (e.g.
+    "4096") or ``None`` to leave that position untouched. The descriptor block
+    is reconstructed line-by-line so original indentation is preserved when the
+    shape spans multiple lines.
+    """
+    if not peer_extents or all(extent is None for extent in peer_extents):
+        return lines
+    text = "\n".join(lines)
+    match = re.search(r"(shape\s*=\s*\[)([\s\S]*?)(\])", text)
+    if not match:
+        return lines
+    parts = _split_top_level_commas(match.group(2))
+    if len(parts) != len(peer_extents):
+        return lines
+    rewritten: List[str] = []
+    for part, extent in zip(parts, peer_extents):
+        if extent is None:
+            rewritten.append(part)
+        else:
+            leading = part[: len(part) - len(part.lstrip())]
+            trailing = part[len(part.rstrip()) :]
+            rewritten.append(f"{leading}{extent}{trailing}")
+    new_shape = ",".join(rewritten)
+    new_text = text[: match.start(2)] + new_shape + text[match.end(2) :]
+    return new_text.split("\n")
+
+
+def _split_top_level_commas(text: str) -> List[str]:
+    """Split a string by top-level commas (ignoring those inside parens/brackets)."""
+    parts: List[str] = []
+    depth = 0
+    last = 0
+    for idx, ch in enumerate(text):
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[last:idx])
+            last = idx + 1
+    parts.append(text[last:])
+    return parts
+
+
+def _rewrite_descriptor_call_offsets(
+    lines: List[str],
+    descriptor: str,
+    adjust_exprs: List[Optional[str]],
+) -> None:
+    """Add per-axis adjustment expressions to each offset element of every
+    `<descriptor>.<op>([offs0, offs1, ...], ...)` call site, in-place.
+
+    ``adjust_exprs[i]`` is the expression added to the i-th offset element; if
+    ``None``, that axis is left untouched.
+    """
+    if not any(expr for expr in adjust_exprs):
+        return
+    pattern = re.compile(
+        rf"\b{re.escape(descriptor)}\.\w+\s*\(\s*\["
+    )
+    for idx, line in enumerate(lines):
+        match = pattern.search(line)
+        if match is None:
+            continue
+        start = match.end()  # position right after the opening '['
+        depth = 1
+        end = start
+        while end < len(line) and depth > 0:
+            ch = line[end]
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+            end += 1
+        if depth != 0:
+            # offset list spans multiple lines — skip rather than corrupt
+            continue
+        offsets_str = line[start:end]
+        parts = _split_top_level_commas(offsets_str)
+        if len(parts) != len(adjust_exprs):
+            continue
+        rewritten: List[str] = []
+        for raw, adjust in zip(parts, adjust_exprs):
+            stripped = raw.strip()
+            if not stripped:
+                rewritten.append(raw)
+                continue
+            if adjust is None:
+                rewritten.append(raw)
+            else:
+                leading = raw[: len(raw) - len(raw.lstrip())]
+                trailing = raw[len(raw.rstrip()):]
+                rewritten.append(f"{leading}({stripped}) + {adjust}{trailing}")
+        new_offsets = ",".join(rewritten)
+        lines[idx] = line[:start] + new_offsets + line[end:]
 
 
 def _nonrange_block_exprs(axis_counts: List[AxisCount]) -> List[str]:
@@ -310,6 +545,7 @@ def _generate_dispatch_block(
     consumer_role: Optional[_SignalRole],
     consumer_descriptors: Tuple[str, ...],
     enable_producer: bool,
+    remote_specs: Tuple[_RemoteSpec, ...] = (),
 ) -> _DispatchGenerationResult:
     axis_counts = parsed.axis_counts
     num_axes = len(axis_counts)
@@ -347,6 +583,15 @@ def _generate_dispatch_block(
         )
         for descriptor in consumer_descriptors:
             block.append(f"{inner}{descriptor} = dl.consume_token({descriptor}, token)")
+    for spec in remote_specs:
+        block.append(
+            f"{indent}{spec.cur_target_rank_var} = tl.load({spec.target_rank_arg} + wave_idx)"
+        )
+        block.append(
+            f"{indent}{spec.remote_ptr_var} = dl.symm_at({spec.base_ptr_arg}, {spec.cur_target_rank_var})"
+        )
+        for line in _reindent(spec.rebuild_template, indent):
+            block.append(line)
     previous_load = "tl.load(cum_wave_sizes + wave_idx - 1)"
     if block_product:
         previous_load = _scale_expression(previous_load, block_product)
@@ -431,6 +676,39 @@ def _generate_dispatch_block(
     return context
 
 
+def _emit_remote_dst_offset_setup(
+    indent: str,
+    remote_specs: Tuple[_RemoteSpec, ...],
+    axis_info: List[_PersistentAxisInfo],
+    *,
+    wave_dim_name: str,
+    wave_var: str,
+) -> List[str]:
+    """Emit per-binding `cur_<desc>_dst_offset_<axis>` loads + adjustment vars.
+
+    For each remote binding, loads the per-wave dst offset for each axis (in
+    tile units, divided by BLOCK_SIZE_<axis>) and pre-computes the byte-level
+    adjustment expression `(cur_dst_offset - cur_offset) * BLOCK_SIZE` once per
+    wave so call-site rewrites can be a single `+ <adjust>` per offset.
+    """
+    out: List[str] = []
+    for spec in remote_specs:
+        for info in axis_info:
+            cur_var, _ = spec.axis_var_names[info.axis.axis]
+            block_expr = _formatted_block_expr(info.block_expr)
+            load_expr = f"tl.load({spec.dst_offsets_arg} + {wave_var} * {wave_dim_name} + {info.index})"
+            load_expr = _scale_expression(load_expr, block_expr)
+            out.append(f"{indent}{cur_var} = {load_expr}")
+        for info in axis_info:
+            cur_var, adjust_var = spec.axis_var_names[info.axis.axis]
+            block_expr = _formatted_block_expr(info.block_expr)
+            mul = f" * ({block_expr})" if block_expr else ""
+            out.append(
+                f"{indent}{adjust_var} = ({cur_var} - {info.offset_var}){mul}"
+            )
+    return out
+
+
 def _generate_persistent_init_block(
     parsed: ParsedAnnotations,
     axis_info: List[_PersistentAxisInfo],
@@ -439,6 +717,7 @@ def _generate_persistent_init_block(
     wave_dim_name: str,
     cur_wave_sizes_arg: str,
     wave_offsets_arg: str,
+    remote_specs: Tuple[_RemoteSpec, ...] = (),
 ) -> List[str]:
     if parsed.persistent_init is None:
         raise AnnotationError("Persistent kernels require @sy.persistent_init region")
@@ -465,6 +744,15 @@ def _generate_persistent_init_block(
     filtered = [info.size_var for info in axis_info if info.axis.kind != "range"]
     tiles_expr = " * ".join(filtered) or "1"
     block.append(f"{indent}cur_tiles = {tiles_expr}")
+    block.extend(
+        _emit_remote_dst_offset_setup(
+            indent,
+            remote_specs,
+            axis_info,
+            wave_dim_name=wave_dim_name,
+            wave_var="cur_wave",
+        )
+    )
     return block
 
 
@@ -479,6 +767,7 @@ def _generate_persistent_dispatch_block(
     wave_dim_name: str,
     cur_wave_sizes_arg: str,
     wave_offsets_arg: str,
+    remote_specs: Tuple[_RemoteSpec, ...] = (),
 ) -> _DispatchGenerationResult:
     indent = parsed.dispatch.indent
     block: List[str] = []
@@ -504,17 +793,38 @@ def _generate_persistent_dispatch_block(
             f"{while_indent}{role.persistent_offset_var} = tl.load({role.offsets_arg} + cur_wave)"
         )
     block.append(f"{while_indent}new_wave = True")
-    if consumer_role is not None:
-        offset_var = consumer_role.persistent_offset_var
-        ptr_arg = consumer_role.ptr_arg
-        block.append(f"{indent}if new_wave and {offset_var} >= 0:")
-        wait_indent = indent + "    "
-        block.append(f"{wait_indent}new_wave = False")
-        block.append(
-            f"{wait_indent}token = dl.wait({ptr_arg} + {offset_var}, 1, \"gpu\", \"acquire\", waitValue=1)"
+    if consumer_role is not None or remote_specs:
+        block.append(f"{indent}if new_wave:")
+        new_wave_indent = indent + "    "
+        block.append(f"{new_wave_indent}new_wave = False")
+        if consumer_role is not None:
+            offset_var = consumer_role.persistent_offset_var
+            ptr_arg = consumer_role.ptr_arg
+            block.append(f"{new_wave_indent}if {offset_var} >= 0:")
+            wait_indent = new_wave_indent + "    "
+            block.append(
+                f"{wait_indent}token = dl.wait({ptr_arg} + {offset_var}, 1, \"gpu\", \"acquire\", waitValue=1)"
+            )
+            for descriptor in consumer_descriptors:
+                block.append(f"{wait_indent}{descriptor} = dl.consume_token({descriptor}, token)")
+        for spec in remote_specs:
+            block.append(
+                f"{new_wave_indent}{spec.cur_target_rank_var} = tl.load({spec.target_rank_arg} + cur_wave)"
+            )
+            block.append(
+                f"{new_wave_indent}{spec.remote_ptr_var} = dl.symm_at({spec.base_ptr_arg}, {spec.cur_target_rank_var})"
+            )
+            for line in _reindent(spec.rebuild_template, new_wave_indent):
+                block.append(line)
+        block.extend(
+            _emit_remote_dst_offset_setup(
+                new_wave_indent,
+                remote_specs,
+                axis_info,
+                wave_dim_name=wave_dim_name,
+                wave_var="cur_wave",
+            )
         )
-        for descriptor in consumer_descriptors:
-            block.append(f"{wait_indent}{descriptor} = dl.consume_token({descriptor}, token)")
 
     block.append("")
     tile_var = parsed.tile_id_var
@@ -755,6 +1065,7 @@ class AnnotationTransformer:
         enable_consumer: bool = False,
         consumer_descriptors: Tuple[str, ...] = ("desc_k", "desc_v"),
         enable_producer: bool = False,
+        remote_descriptors: Optional[Mapping[str, RemoteBinding]] = None,
     ) -> None:
         if enable_consumer and not consumer_descriptors:
             raise ValueError(
@@ -763,6 +1074,7 @@ class AnnotationTransformer:
         self.enable_consumer = enable_consumer
         self.enable_producer = enable_producer
         self.consumer_descriptors = tuple(consumer_descriptors)
+        self.remote_descriptors: Dict[str, RemoteBinding] = dict(remote_descriptors or {})
 
         multi_role = int(enable_consumer) + int(enable_producer) > 1
 
@@ -819,6 +1131,7 @@ class AnnotationTransformer:
         args.extend(self._signal_extra_args())
         if self.enable_producer and self.producer_counter_arg is not None:
             args.append(f"{self.producer_counter_arg}=None")
+        args.extend(self._remote_extra_args())
         args.append("cum_tiles=0")
         args.append("NUM_WAVES: tl.constexpr=0")
         return ", ".join(args)
@@ -831,6 +1144,7 @@ class AnnotationTransformer:
         args.extend(self._signal_extra_args())
         if self.enable_producer and self.producer_counter_arg is not None:
             args.append(f"{self.producer_counter_arg}=None")
+        args.extend(self._remote_extra_args())
         args.append("cum_tiles=0")
         return ", ".join(args)
 
@@ -841,11 +1155,126 @@ class AnnotationTransformer:
             args.append(f"{role.offsets_arg}=None")
         return args
 
+    def _remote_target_rank_arg(self, descriptor: str) -> str:
+        """Kernel arg name that carries per-wave peer ranks for a given descriptor.
+
+        Single-binding mode collapses to plain ``target_rank`` for ergonomics;
+        multi-binding mode disambiguates by descriptor name.
+        """
+        if len(self.remote_descriptors) <= 1:
+            return "target_rank"
+        return f"target_rank_{descriptor}"
+
+    def _remote_dst_offsets_arg(self, descriptor: str) -> str:
+        if len(self.remote_descriptors) <= 1:
+            return "dst_offsets"
+        return f"dst_offsets_{descriptor}"
+
+    def _remote_extra_args(self) -> List[str]:
+        args: List[str] = []
+        for name in self.remote_descriptors:
+            args.append(f"{self._remote_target_rank_arg(name)}=None")
+            args.append(f"{self._remote_dst_offsets_arg(name)}=None")
+        return args
+
+    def _build_remote_specs(
+        self, lines: List[str], parsed: ParsedAnnotations
+    ) -> Tuple[_RemoteSpec, ...]:
+        if not self.remote_descriptors:
+            return ()
+        single = len(self.remote_descriptors) == 1
+        specs: List[_RemoteSpec] = []
+        for desc_name, binding in self.remote_descriptors.items():
+            target_rank_arg = self._remote_target_rank_arg(desc_name)
+            dst_offsets_arg = self._remote_dst_offsets_arg(desc_name)
+            cur_target_rank_var = (
+                "cur_target_rank" if single else f"cur_target_rank_{desc_name}"
+            )
+            remote_ptr_var = (
+                f"remote_{binding.base_ptr_arg}"
+                if single
+                else f"remote_{binding.base_ptr_arg}_{desc_name}"
+            )
+            decl_start, decl_end = _find_descriptor_decl(lines, desc_name)
+            decl_lines = lines[decl_start : decl_end + 1]
+            base_indent_str, dedented = _strip_indent(decl_lines)
+            rebuild_template = _replace_first_identifier(
+                dedented, binding.base_ptr_arg, remote_ptr_var
+            )
+            descriptor_axes = _extract_descriptor_shape_axes(
+                decl_lines, [axis.axis for axis in parsed.axis_counts]
+            )
+
+            # The descriptor lives on a peer's allocation (per-rank slice), so
+            # its declared shape must match peer-side extents — not the global
+            # tensor shape baked into the source. Per-axis extents come from
+            # the schedule's first wave tile shape (assumed uniform across
+            # waves; non-uniform schedules need a runtime-loaded variant).
+            schedule_blocks = binding.schedule.block_infos
+            first_block_shape: Tuple[int, ...] = ()
+            if schedule_blocks and schedule_blocks[0]:
+                first_block_shape = schedule_blocks[0][0].tile.shape
+            peer_extents: List[Optional[str]] = []
+            for pos_axis_name in descriptor_axes:
+                if pos_axis_name is None:
+                    peer_extents.append(None)
+                    continue
+                annot_idx = next(
+                    (
+                        i
+                        for i, ax in enumerate(parsed.axis_counts)
+                        if ax.axis == pos_axis_name
+                    ),
+                    None,
+                )
+                if annot_idx is None or annot_idx >= len(first_block_shape):
+                    peer_extents.append(None)
+                else:
+                    peer_extents.append(str(int(first_block_shape[annot_idx])))
+            rebuild_template = _rewrite_descriptor_shape_positions(
+                rebuild_template, peer_extents
+            )
+
+            axis_var_names: Dict[str, Tuple[str, str]] = {}
+            for axis in parsed.axis_counts:
+                cur_var = (
+                    f"cur_dst_offset_{axis.axis.lower()}"
+                    if single
+                    else f"cur_{desc_name}_dst_offset_{axis.axis.lower()}"
+                )
+                adjust_var = (
+                    f"dst_offset_adjust_{axis.axis.lower()}"
+                    if single
+                    else f"{desc_name}_dst_offset_adjust_{axis.axis.lower()}"
+                )
+                axis_var_names[axis.axis] = (cur_var, adjust_var)
+
+            specs.append(
+                _RemoteSpec(
+                    descriptor=desc_name,
+                    base_ptr_arg=binding.base_ptr_arg,
+                    target_rank_arg=target_rank_arg,
+                    cur_target_rank_var=cur_target_rank_var,
+                    remote_ptr_var=remote_ptr_var,
+                    decl_start=decl_start,
+                    decl_end=decl_end,
+                    is_reduce=binding.schedule.is_reduce(),
+                    role=binding.schedule.role(),
+                    rebuild_template=rebuild_template,
+                    dst_offsets_arg=dst_offsets_arg,
+                    axis_var_names=axis_var_names,
+                    descriptor_axes=descriptor_axes,
+                )
+            )
+        return tuple(specs)
+
     def transform(self, source: str) -> str:
         lines = source.splitlines()
-        if self.enable_consumer or self.enable_producer:
+        if self.enable_consumer or self.enable_producer or self.remote_descriptors:
             lines = _ensure_import(lines, "import triton_dist.language as dl")
         parsed = parse_annotations(lines)
+
+        remote_specs = self._build_remote_specs(lines, parsed)
 
         persistent_init_lines: Optional[List[str]] = None
         producer_epilogue_lines: Optional[List[str]] = None
@@ -866,6 +1295,7 @@ class AnnotationTransformer:
                 wave_dim_name=wave_dim_name,
                 cur_wave_sizes_arg=cur_wave_sizes_arg,
                 wave_offsets_arg=wave_offsets_arg,
+                remote_specs=remote_specs,
             )
             persistent_init_lines = _generate_persistent_init_block(
                 parsed,
@@ -874,6 +1304,7 @@ class AnnotationTransformer:
                 wave_dim_name=wave_dim_name,
                 cur_wave_sizes_arg=cur_wave_sizes_arg,
                 wave_offsets_arg=wave_offsets_arg,
+                remote_specs=remote_specs,
             )
             extra_args = self._persistent_extra_args()
         else:
@@ -884,6 +1315,7 @@ class AnnotationTransformer:
                 consumer_role=self.consumer_signal_role,
                 consumer_descriptors=self.consumer_descriptors,
                 enable_producer=self.enable_producer,
+                remote_specs=remote_specs,
             )
             extra_args = self._nonpersistent_extra_args()
         if dispatch_result is None:
@@ -915,6 +1347,10 @@ class AnnotationTransformer:
             )
         def_start = _find_def_start(lines, parsed.dispatch.start)
         signature_lines, def_end = _augment_signature_lines(lines, def_start, extra_args)
+
+        remote_decl_index: Dict[int, _RemoteSpec] = {
+            spec.decl_start: spec for spec in remote_specs
+        }
 
         # locate the line with the kernel definition we need to patch
         new_lines: List[str] = []
@@ -949,12 +1385,44 @@ class AnnotationTransformer:
                     new_lines.extend(producer_epilogue_lines)
                 idx = parsed.producer_epilogue.end + 1
                 continue
+            if idx in remote_decl_index:
+                spec = remote_decl_index[idx]
+                indent = lines[idx][: len(lines[idx]) - len(lines[idx].lstrip())]
+                new_lines.append(
+                    f"{indent}{spec.cur_target_rank_var} = tl.load({spec.target_rank_arg})"
+                )
+                new_lines.append(
+                    f"{indent}{spec.remote_ptr_var} = dl.symm_at({spec.base_ptr_arg}, {spec.cur_target_rank_var})"
+                )
+                new_lines.extend(_reindent(spec.rebuild_template, indent))
+                idx = spec.decl_end + 1
+                continue
             new_lines.append(lines[idx])
             idx += 1
 
         if parsed.persistent:
             _rewrite_kernel_num_tiles(new_lines, parsed.axis_counts)
         new_lines = _transform_host_entries(new_lines, parsed.axis_counts)
+
+        for spec in remote_specs:
+            if spec.is_reduce and spec.role == "producer":
+                _rewrite_store_to_atomic_add(new_lines, spec.descriptor)
+
+        # Adjust each remote descriptor's call-site offsets so the access lands
+        # at the peer-side dst position rather than the source-side global one.
+        # Mapping is per descriptor position: positions that don't correspond
+        # to any annotation axis (e.g. the K dim of a 2-D matmul descriptor)
+        # stay untouched.
+        for spec in remote_specs:
+            adjust_exprs: List[Optional[str]] = []
+            for axis_name in spec.descriptor_axes:
+                if axis_name is None:
+                    adjust_exprs.append(None)
+                else:
+                    adjust_exprs.append(spec.axis_var_names[axis_name][1])
+            _rewrite_descriptor_call_offsets(
+                new_lines, spec.descriptor, adjust_exprs
+            )
 
         result = "\n".join(new_lines)
         if source.endswith("\n"):
