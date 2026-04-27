@@ -37,9 +37,13 @@ def _load_transformed_attention(example_path: Path):
     transformer = AnnotationTransformer(enable_consumer=True)
     transformed = transformer.transform(example_path.read_text())
 
-    generated_path = Path("/tmp" + example_path.name.replace(".py", "_transformed.py"))
-    with open(generated_path, "r") as f:
-        existing = f.read()
+    generated_path = Path("/tmp/" + example_path.name.replace(".py", "_transformed.py"))
+    try:
+        with open(generated_path, "r") as f:
+            existing = f.read()
+    except FileNotFoundError:
+        existing = None
+
     if existing != transformed:
         with open(generated_path, "w") as f:
             f.write(transformed)
