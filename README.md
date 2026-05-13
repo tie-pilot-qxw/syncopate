@@ -7,6 +7,14 @@ let an evaluator verify that the code is retrievable and that the core compiler
 passes are runnable. Reproducing the full set of paper numbers requires
 specialized multi-GPU hardware (see [Detailed Instructions](#detailed-instructions)).
 
+## Artifact Evaluation Version
+
+The fixed version submitted for OSDI '26 Artifact Evaluation is:
+
+- Git commit: `9c4c0db9919a6243df41cc5033000797dc6ce901`
+
+AEC reviewers should use this commit as the evaluated version of the artifact.
+
 ---
 
 ## Getting Started Instructions
