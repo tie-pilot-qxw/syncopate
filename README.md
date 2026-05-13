@@ -2,7 +2,7 @@
 
 Experimental compiler for fine-grained communication/computation overlap.
 
-This repository is the artifact for our OSDI '26 paper. The instructions below are intended to
+This repository is the artifact for our OSDI '26 paper **Syncopate: Efficient Multi-GPU AI Kernels via Automatic Chunk-Centric Compute-Communication Overlap**. The instructions below are intended to
 let an evaluator verify that the code is retrievable and that the core compiler
 passes are runnable. Reproducing the full set of paper numbers requires
 specialized multi-GPU hardware (see [Detailed Instructions](#detailed-instructions)).
@@ -166,3 +166,5 @@ This repository depends on:
 
 All third-party code retains its original license; see the respective
 upstream repositories.
+
+This project is licensed under the MIT License. Please see the LICENSE file for details. We welcome the community to use, compare, and extend this artifact for research purposes.
