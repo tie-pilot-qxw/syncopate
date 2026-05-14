@@ -2,10 +2,17 @@
 
 Experimental compiler for fine-grained communication/computation overlap.
 
-This repository is the artifact for our OSDI '26 paper **Syncopate: Efficient Multi-GPU AI Kernels via Automatic Chunk-Centric Compute-Communication Overlap**. The instructions below are intended to
+The instructions below are intended to
 let an evaluator verify that the code is retrievable and that the core compiler
 passes are runnable. Reproducing the full set of paper numbers requires
 specialized multi-GPU hardware (see [Detailed Instructions](#detailed-instructions)).
+
+## Paper Reference
+
+**Syncopate: Efficient Multi-GPU AI Kernels via Automatic Chunk-Centric Compute-Communication Overlap**  
+Xinwei Qiang, Yue Guan, Zhengding Hu, Keren Zhou, Yufei Ding, Adnan Aziz.
+In *Proceedings of the 20th USENIX Symposium on Operating Systems Design and Implementation (OSDI '26)*, 2026.
+
 
 ## Artifact Evaluation Version
 
