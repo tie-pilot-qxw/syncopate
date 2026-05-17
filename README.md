@@ -102,6 +102,11 @@ The remaining tests and benchmarks generate and run real GPU kernels and
 require a multi-GPU machine with the full Triton-distributed / NVSHMEM stack
 installed. We provide a `Dockerfile` that pins all of the dependencies.
 
+Experiment entrypoints are additionally reorganized under `experiments/`
+according to the paper figures. See `experiments/README.md` for the
+figure-to-script mapping and notes about which external baselines are not
+currently vendored in this repository.
+
 ### Hardware
 
 The experiments in the paper were run on multi-GPU NVIDIA Hopper systems
@@ -151,7 +156,7 @@ your machine if the default does not exist.
 | `syncopate/computation/` | GEMM and attention kernel templates and the transform pass |
 | `syncopate/interface/` | Lowering from plans to per-rank schedules and tile schedules |
 | `tests/` | End-to-end tests, including fused all-gather + GEMM, all-to-all + attention, GEMM + reduce-scatter, and the CPU-only compiler-pass tests used by Getting Started |
-| `baselines/` | Reference implementations we compare against in the paper: `nccl/`, `async_tp/`, `domino/`, `alpa/` |
+| `experiments/` | Figure-oriented experiment entrypoints and per-figure README files that map paper results to in-repo scripts and external baselines |
 | `utils/` | `launch.sh`, microbenchmarks (`benchmark_gemm_lookup.py`, `copy_engine_bandwidth.py`, `sm_bandwidth.py`, `sm_throughput.py`, `attn_flops.py`), and small helpers |
 
 ### Notable end-to-end tests
@@ -168,6 +173,14 @@ to the workloads discussed in the paper:
 
 Each test prints kernel timing and a correctness check against an unfused
 reference.
+
+For figure-oriented reproduction, use `experiments/README.md` as the top-level
+index:
+
+- `experiments/fig_operator_results/` — GEMM operator-results figure
+- `experiments/fig_attention_results/` — attention operator-results figure
+- `experiments/fig_ir_example/` — IR-lowering / compiler-integration figure
+- `experiments/fig_ablation_sensitivity/` — ablation and sensitivity figure
 
 ---
 
