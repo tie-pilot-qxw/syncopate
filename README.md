@@ -18,7 +18,7 @@ In *Proceedings of the 20th USENIX Symposium on Operating Systems Design and Imp
 
 The fixed version submitted for OSDI '26 Artifact Evaluation is:
 
-- Git commit: `9c4c0db9919a6243df41cc5033000797dc6ce901`
+- Git commit: `ce2b13e496eb6629ab42aac2aec1d9e31e084ba6`
 
 AEC reviewers should use this commit as the evaluated version of the artifact.
 
