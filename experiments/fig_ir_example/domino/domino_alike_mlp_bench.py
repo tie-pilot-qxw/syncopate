@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from baselines.domino.domino_alike_mlp import DominoAlikeMLP, DominoAlikeMLPConfig
+from domino_alike_mlp import DominoAlikeMLP, DominoAlikeMLPConfig
 
 
 def parse_dtype(name: str) -> torch.dtype:
