@@ -12,7 +12,20 @@ specialized multi-GPU hardware (see [Detailed Instructions](#detailed-instructio
 **[Syncopate: Efficient Multi-GPU AI Kernels via Automatic Chunk-Centric Compute-Communication Overlap](https://www.usenix.org/conference/osdi26/presentation/qiang)**  
 Xinwei Qiang, Yue Guan, Zhengding Hu, Keren Zhou, Yufei Ding, Adnan Aziz.  
 In *Proceedings of the 20th USENIX Symposium on Operating Systems Design and Implementation (OSDI '26)*, 2026.
-
+```bibtex
+@inproceedings {syncopate,
+author = {Xinwei Qiang and Yue Guan and Zhengding Hu and Keren Zhou and Yufei Ding and Adnan Aziz},
+title = {Syncopate: Efficient {Multi-GPU} {AI} Kernels via Automatic {Chunk-Centric} {Compute-Communication} Overlap},
+booktitle = {20th USENIX Symposium on Operating Systems Design and Implementation (OSDI 26)},
+year = {2026},
+isbn = {978-1-939133-55-7},
+address = {Seattle, WA},
+pages = {331--347},
+url = {https://www.usenix.org/conference/osdi26/presentation/qiang},
+publisher = {USENIX Association},
+month = jul
+}
+```
 
 ## Artifact Evaluation Version
 
